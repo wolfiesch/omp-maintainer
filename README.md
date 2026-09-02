@@ -1,11 +1,22 @@
 # OMP Maintainer
 
-OMP Maintainer is a self-hosted GitHub App service for handling approved repository work with bounded publication rules. It receives selected GitHub events, prepares isolated workspaces, and can open constrained pull requests or add repository comments when the installed repository policy permits it.
+[![CI](https://github.com/wolfiesch/omp-maintainer/actions/workflows/ci.yml/badge.svg)](https://github.com/wolfiesch/omp-maintainer/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB.svg?logo=python&logoColor=white)](pyproject.toml)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-It is designed for maintainers who want a local operational boundary: GitHub App credentials remain in a small broker service, while the maintainer service has only an authenticated connection to that broker. Start with one non-critical repository and the included strict policy.
+Policy-controlled autonomous maintenance for self-hosted GitHub repositories. OMP Maintainer runs OMP behind a credential-isolated GitHub App broker, with repository-owned policy governing every external mutation.
+
+It is built for maintainers who want issue triage, pull-request review, bounded fixes, and durable follow-up without granting an agent unrestricted GitHub credentials.
+
+[Quickstart](#prerequisites) · [Architecture](#architecture-and-trust-boundary) · [Repository policy](#install-the-per-repository-policy) · [Security limits](#security-limits)
+
+> [!IMPORTANT]
+> Status: early self-hosted release. Start with one non-critical repository, keep merge and release automation disabled, and inspect every proposed change.
 
 > [!WARNING]
 > This service can create branches, commits, pull requests, labels, and comments when policy permits. It does not merge by default, but an opened pull request or comment is still a publication. Read the policy and trust-boundary sections before installing the App.
+
+![OMP Maintainer dashboard showing an idle, healthy self-hosted instance](docs/assets/dashboard.png)
 
 ## What it handles
 
@@ -293,6 +304,10 @@ This deployment deliberately limits, but cannot eliminate, risk:
 - Direct provider credentials are optional and have a broader task-process trust boundary. GitHub App credentials never cross that boundary.
 - Local usage limits are post-turn estimates, not hard billing caps. One turn can overshoot before work stops.
 - Cancellation and restart are operational stops, not remote rollback. Published GitHub state requires human review and any required manual remediation.
+
+## Contributing and support
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and change requirements. Use [GitHub Discussions](https://github.com/wolfiesch/omp-maintainer/discussions) for deployment and policy questions, structured [GitHub Issues](https://github.com/wolfiesch/omp-maintainer/issues/new/choose) for defects or feature requests, and [private vulnerability reporting](https://github.com/wolfiesch/omp-maintainer/security/advisories/new) for security reports. The complete support routing is in [SUPPORT.md](SUPPORT.md).
 
 ## License and upstream provenance
 

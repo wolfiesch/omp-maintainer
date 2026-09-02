@@ -1,0 +1,47 @@
+name: Feature request
+description: Propose a bounded maintainer capability or workflow improvement
+title: "feature: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the maintainer workflow or failure mode this should improve.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the observable result without prescribing an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: boundary
+    attributes:
+      label: Trust-boundary impact
+      description: State whether this changes credentials, webhook intake, policy, command execution, GitHub publication, merge, release, dashboard access, or durable state.
+    validations:
+      required: true
+  - type: textarea
+    id: policy
+    attributes:
+      label: Proposed default policy
+      description: Explain whether the behavior should be denied, inspect-only, or mutation-enabled by default.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include the current manual workflow or a smaller bounded option.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: I have identified any new external mutation or credential access this requires.
+          required: true
+        - label: I have not included credentials, private repository data, or personal information.
+          required: true

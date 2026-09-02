@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/wolfiesch/omp-maintainer/security/advisories/new
+    about: Report credential, policy-bypass, command-execution, or publication vulnerabilities privately.
+  - name: Usage question or deployment discussion
+    url: https://github.com/wolfiesch/omp-maintainer/discussions
+    about: Ask setup, policy, provider, or operational questions without filing a defect.

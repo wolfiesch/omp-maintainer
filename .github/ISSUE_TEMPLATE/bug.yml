@@ -1,0 +1,62 @@
+name: Bug report
+description: Report a reproducible defect in OMP Maintainer
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a defect. Remove credentials, repository data, and private logs before submitting. Report vulnerabilities through the private security advisory link instead.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Release tag or commit SHA.
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Docker Compose
+        - Source checkout
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+      description: What happened, including redacted logs or durable event metadata.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal, deterministic steps using test credentials and a non-critical repository.
+    validations:
+      required: true
+  - type: textarea
+    id: policy
+    attributes:
+      label: Relevant policy and configuration
+      description: Include only non-secret fields. State whether the repository policy was read from the default branch.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, tokens, private repository data, and personal information.
+          required: true
+        - label: This is not a vulnerability report. Security issues use private vulnerability reporting.
+          required: true
