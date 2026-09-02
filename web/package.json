@@ -1,0 +1,28 @@
+{
+  "name": "omp-maintainer-web",
+  "private": true,
+  "version": "0.1.0",
+  "author": "Stencil Labs, Inc.",
+  "license": "MIT",
+  "type": "module",
+  "description": "Flat SolidJS operations console bundled by Vite and served by OMP Maintainer's FastAPI app.",
+  "homepage": "https://omp.sh",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check:types": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "solid-js": "^1.9.14"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.2",
+    "@types/bun": "^1.3.14",
+    "tailwindcss": "^4.3.2",
+    "typescript": "^7.0.2",
+    "vite": "^8.1.4",
+    "vite-plugin-solid": "^2.11.12"
+  }
+}

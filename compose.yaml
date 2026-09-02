@@ -1,0 +1,142 @@
+services:
+  maintainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BUN_VERSION: ${OMP_MAINTAINER_BUN_VERSION:-1.4.0}
+        OMP_PACKAGE_VERSION: ${OMP_MAINTAINER_OMP_PACKAGE_VERSION:-18.1.2}
+    image: omp-maintainer:local
+    command: ["python", "-m", "omp_maintainer", "serve"]
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    environment:
+      # The maintainer uses this authenticated, internal-only channel for all
+      # GitHub writes. GitHub credentials are intentionally absent from this service.
+      OMP_MAINTAINER_GH_PROXY_URL: http://github-broker:8081
+      OMP_MAINTAINER_GH_PROXY_HMAC_KEY: ${OMP_MAINTAINER_GH_PROXY_HMAC_KEY:?OMP_MAINTAINER_GH_PROXY_HMAC_KEY must be set}
+
+      # Webhook identity and repository policy.
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:?GITHUB_WEBHOOK_SECRET must be set}
+      OMP_MAINTAINER_BOT_LOGIN: ${OMP_MAINTAINER_BOT_LOGIN:?OMP_MAINTAINER_BOT_LOGIN must be set}
+      OMP_MAINTAINER_GIT_AUTHOR_NAME: ${OMP_MAINTAINER_GIT_AUTHOR_NAME:-}
+      OMP_MAINTAINER_GIT_AUTHOR_EMAIL: ${OMP_MAINTAINER_GIT_AUTHOR_EMAIL:?OMP_MAINTAINER_GIT_AUTHOR_EMAIL must be set}
+      OMP_MAINTAINER_REPO_ALLOWLIST: ${OMP_MAINTAINER_REPO_ALLOWLIST:?OMP_MAINTAINER_REPO_ALLOWLIST must be set}
+      OMP_MAINTAINER_MAINTAINER_LOGINS: ${OMP_MAINTAINER_MAINTAINER_LOGINS:-}
+      OMP_MAINTAINER_REVIEWER_BOTS: ${OMP_MAINTAINER_REVIEWER_BOTS:-}
+
+      # Workflow policy.
+      OMP_MAINTAINER_PR_REVIEW_ENABLED: ${OMP_MAINTAINER_PR_REVIEW_ENABLED:-true}
+      OMP_MAINTAINER_RELEASE_SENTINEL_ENABLED: ${OMP_MAINTAINER_RELEASE_SENTINEL_ENABLED:-false}
+      OMP_MAINTAINER_RELEASE_COMMIT_PREFIX: "${OMP_MAINTAINER_RELEASE_COMMIT_PREFIX:-chore: bump version to }"
+      OMP_MAINTAINER_RELEASE_MAX_ROUNDS: ${OMP_MAINTAINER_RELEASE_MAX_ROUNDS:-5}
+      OMP_MAINTAINER_RELEASE_TASK_TIMEOUT_SECONDS: ${OMP_MAINTAINER_RELEASE_TASK_TIMEOUT_SECONDS:-3600}
+      OMP_MAINTAINER_RELEASE_MODEL: ${OMP_MAINTAINER_RELEASE_MODEL:-}
+
+      # OMP execution and service tuning.
+      OMP_MAINTAINER_MODEL: ${OMP_MAINTAINER_MODEL:-anthropic/claude-sonnet-4-6}
+      OMP_MAINTAINER_PROVIDER: ${OMP_MAINTAINER_PROVIDER:-}
+      # Optional direct OMP provider credentials and endpoint configuration.
+      # These values are available to OMP task processes; GitHub App identity
+      # remains isolated in github-broker below.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_OAUTH_TOKEN: ${ANTHROPIC_OAUTH_TOKEN:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_CODEX_OAUTH_TOKEN: ${OPENAI_CODEX_OAUTH_TOKEN:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      TOGETHER_API_KEY: ${TOGETHER_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      LM_STUDIO_BASE_URL: ${LM_STUDIO_BASE_URL:-}
+      LLAMA_CPP_BASE_URL: ${LLAMA_CPP_BASE_URL:-}
+
+      OMP_MAINTAINER_THINKING: ${OMP_MAINTAINER_THINKING:-high}
+      OMP_MAINTAINER_MAX_CONCURRENCY: ${OMP_MAINTAINER_MAX_CONCURRENCY:-8}
+      OMP_MAINTAINER_TASK_TIMEOUT_SECONDS: ${OMP_MAINTAINER_TASK_TIMEOUT_SECONDS:-2400}
+      OMP_MAINTAINER_TASK_TIMEOUT_HARD_GRACE_SECONDS: ${OMP_MAINTAINER_TASK_TIMEOUT_HARD_GRACE_SECONDS:-60}
+      OMP_MAINTAINER_REQUEST_TIMEOUT_SECONDS: ${OMP_MAINTAINER_REQUEST_TIMEOUT_SECONDS:-120}
+      OMP_MAINTAINER_SHUTDOWN_DRAIN_TIMEOUT_SECONDS: ${OMP_MAINTAINER_SHUTDOWN_DRAIN_TIMEOUT_SECONDS:-25}
+      OMP_MAINTAINER_SHUTDOWN_KILL_TIMEOUT_SECONDS: ${OMP_MAINTAINER_SHUTDOWN_KILL_TIMEOUT_SECONDS:-5}
+      OMP_MAINTAINER_OMP_COMMAND: omp
+
+      # Container-owned state and HTTP listener.
+      OMP_MAINTAINER_WORKSPACE_ROOT: /data/workspaces
+      OMP_MAINTAINER_SQLITE_PATH: /data/maintainer.sqlite
+      OMP_MAINTAINER_LOG_DIR: /data/logs
+      OMP_MAINTAINER_BIND_HOST: 0.0.0.0
+      OMP_MAINTAINER_BIND_PORT: "8080"
+      OMP_MAINTAINER_REPLAY_TOKEN: ${OMP_MAINTAINER_REPLAY_TOKEN:-}
+    depends_on:
+      github-broker:
+        condition: service_healthy
+    networks:
+      - default
+      - github-broker-internal
+    volumes:
+      - maintainer_data:/data
+    ports:
+      - "127.0.0.1:${OMP_MAINTAINER_HTTP_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --show-error http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  github-broker:
+    image: omp-maintainer:local
+    command: ["python", "-m", "omp_maintainer.proxy", "serve"]
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    environment:
+      # The GitHub App identity exists only in this broker. Do not add it to maintainer.
+      OMP_GITHUB_APP_ID: ${GITHUB_APP_ID:?GITHUB_APP_ID must be set}
+      OMP_GITHUB_APP_PRIVATE_KEY_PATH: /run/secrets/github_app_private_key
+      OMP_MAINTAINER_GH_PROXY_HMAC_KEY: ${OMP_MAINTAINER_GH_PROXY_HMAC_KEY:?OMP_MAINTAINER_GH_PROXY_HMAC_KEY must be set}
+
+      # Minimal broker contract: App identity, HMAC secret, broker bind, durable
+      # workspace/log paths, request body cap, and git timeout.
+      OMP_MAINTAINER_WORKSPACE_ROOT: /data/workspaces
+      OMP_MAINTAINER_LOG_DIR: /data/logs
+      OMP_MAINTAINER_GH_PROXY_BIND_HOST: 0.0.0.0
+      OMP_MAINTAINER_GH_PROXY_BIND_PORT: "8081"
+      OMP_MAINTAINER_GH_PROXY_MAX_BODY_BYTES: ${OMP_MAINTAINER_GH_PROXY_MAX_BODY_BYTES:-1048576}
+      OMP_MAINTAINER_GH_PROXY_GIT_TIMEOUT_SECONDS: ${OMP_MAINTAINER_GH_PROXY_GIT_TIMEOUT_SECONDS:-60}
+    networks:
+      # The default network supplies egress to api.github.com; no host port is
+      # published. The authenticated service-to-service channel is internal.
+      - default
+      - github-broker-internal
+    volumes:
+      - maintainer_data:/data
+    secrets:
+      - source: github_app_private_key
+        target: github_app_private_key
+        mode: 0400
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --show-error http://127.0.0.1:8081/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  default: {}
+  github-broker-internal:
+    internal: true
+
+secrets:
+  github_app_private_key:
+    file: ${GITHUB_APP_PRIVATE_KEY_PATH:?GITHUB_APP_PRIVATE_KEY_PATH must be set}
+
+volumes:
+  maintainer_data: {}
