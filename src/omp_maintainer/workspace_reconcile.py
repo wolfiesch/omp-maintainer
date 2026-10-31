@@ -21,6 +21,9 @@ alone. For the rest the live GitHub state decides:
     `pr_number`), and cleaning it up through the old PR would delete it.
   - Otherwise the item's own number decides: once closed, the missed
     `issues.closed` is queued.
+  - An item GitHub no longer serves counts as closed: 410 (deleted), or 404
+    while its repo is still readable (removed as spam or by staff). A repo
+    that 404s too is an access problem, not a deletion, and is retried.
 
 Any activity on the key between the idle check and the enqueue (a webhook or
 maintainer directive arriving during the GitHub round trip) cancels the
@@ -218,13 +221,11 @@ class WorkspaceReconciler:
         repository = {"full_name": cand.repo}
         pr_number = cand.row.pr_number if cand.row is not None else None
         if pr_number is not None:
-            pr = await self._github.get_pull_request(cand.repo, pr_number)
-            if pr.state != "closed":
+            pr_state, merged = await self._live_pr(cand, pr_number)
+            if pr_state != "closed":
                 return None
-            if cand.number != pr_number:
-                issue = await self._github.get_issue(cand.repo, cand.number)
-                if issue.state != "closed":
-                    return None
+            if cand.number != pr_number and await self._live_issue_state(cand, cand.number) != "closed":
+                return None
             # Same key the router assigns a `pull_request.closed` delivery.
             linked = self._db.find_issue_by_pr(cand.repo, pr_number)
             return _MissedClose(
@@ -233,12 +234,11 @@ class WorkspaceReconciler:
                 number=pr_number,
                 payload={
                     "action": "closed",
-                    "pull_request": {"number": pr_number, "merged": pr.merged},
+                    "pull_request": {"number": pr_number, "merged": merged},
                     "repository": repository,
                 },
             )
-        issue = await self._github.get_issue(cand.repo, cand.number)
-        if issue.state != "closed":
+        if await self._live_issue_state(cand, cand.number) != "closed":
             return None
         return _MissedClose(
             event_type="issues",
@@ -246,6 +246,42 @@ class WorkspaceReconciler:
             number=cand.number,
             payload={"action": "closed", "issue": {"number": cand.number}, "repository": repository},
         )
+
+    async def _live_pr(self, cand: _Candidate, number: int) -> tuple[str, bool]:
+        """(state, merged) of PR `number`; a gone PR reads as closed unmerged."""
+        try:
+            pr = await self._github.get_pull_request(cand.repo, number)
+        except GitHubError as exc:
+            if await self._gone(cand, number, exc):
+                return "closed", False
+            raise
+        return pr.state, pr.merged
+
+    async def _live_issue_state(self, cand: _Candidate, number: int) -> str:
+        """State of issue `number`; a gone issue reads as closed."""
+        try:
+            return (await self._github.get_issue(cand.repo, number)).state
+        except GitHubError as exc:
+            if await self._gone(cand, number, exc):
+                return "closed"
+            raise
+
+    async def _gone(self, cand: _Candidate, number: int, exc: GitHubError) -> bool:
+        """True when GitHub no longer serves item `number` at all.
+
+        410 is an explicit deletion. A 404 is ambiguous (lost repo access
+        looks the same), so it counts only while the repo itself still
+        resolves; `get_repo` raising propagates as an ordinary check failure.
+        """
+        if exc.status not in (404, 410):
+            return False
+        if exc.status == 404:
+            await self._github.get_repo(cand.repo)
+        log.info(
+            "workspace reconcile: item gone from GitHub; treating as closed",
+            extra={"key": cand.key, "number": number, "status": exc.status},
+        )
+        return True
 
     def _enqueue(self, cand: _Candidate, missed: _MissedClose, *, idle_since: str) -> bool:
         delivery_id = reconcile_delivery_id(missed.event_type, cand.repo, missed.number)
