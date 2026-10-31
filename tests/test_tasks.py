@@ -58,7 +58,10 @@ async def test_triage_issue_keeps_event_loop_live_while_workspace_setup_blocks(d
     async def _no_closing(*a, **k):
         return ()
 
-    github = SimpleNamespace(list_closing_pull_requests=_no_closing)
+    async def _live_open(_repo, _number):
+        return SimpleNamespace(state="open")
+
+    github = SimpleNamespace(list_closing_pull_requests=_no_closing, get_issue=_live_open)
 
     entered = threading.Event()
     release = threading.Event()
@@ -240,7 +243,10 @@ async def test_triage_issue_reopen_tears_down_finalized_workspace(db, settings, 
     async def _fail_closing(*_a, **_k):
         raise AssertionError("closing-PR guard must not run when a DB row already exists")
 
-    github = SimpleNamespace(list_closing_pull_requests=_fail_closing)
+    async def _live_open(_repo, _number):
+        return SimpleNamespace(state="open")
+
+    github = SimpleNamespace(list_closing_pull_requests=_fail_closing, get_issue=_live_open)
     sandbox = SimpleNamespace(ensure_workspace=_ensure, remove_workspace=_remove)
 
     async def _noop_run_task(**_kwargs):
