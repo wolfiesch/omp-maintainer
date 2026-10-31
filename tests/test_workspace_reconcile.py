@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
 from omp_maintainer.config import Settings
 from omp_maintainer.db import Database, close_database, get_database
-from omp_maintainer.github_client import GitHubError, IssueInfo, PullRequestInfo
+from omp_maintainer.github_client import GitHubError, IssueInfo, PullRequestInfo, RepoInfo
 from omp_maintainer.queue import WorkerPool
 from omp_maintainer.sandbox import SandboxManager, parse_workspace_key, workspace_key
 from omp_maintainer.slot_pool import SlotPool
@@ -20,31 +22,45 @@ REPO = "octo/widget"
 
 
 class _LiveGitHub:
-    """Live GitHub view: `closed`/`merged` numbers, everything else open."""
+    """Live GitHub view: `closed`/`merged` numbers, `gone` numbers erroring with their status, everything else open."""
 
     def __init__(
         self,
         *,
         closed: set[int] = frozenset(),
         merged: set[int] = frozenset(),
+        gone: Mapping[int, int] = MappingProxyType({}),
         error: GitHubError | None = None,
+        repo_error: GitHubError | None = None,
     ) -> None:
         self.closed = set(closed) | set(merged)
         self.merged = set(merged)
+        self.gone = dict(gone)
         self.error = error
+        self.repo_error = repo_error
         self.calls: list[tuple[str, int]] = []
+
+    def _check(self, number: int) -> None:
+        if self.error is not None:
+            raise self.error
+        if number in self.gone:
+            raise GitHubError(self.gone[number], "Not Found" if self.gone[number] == 404 else "Gone")
+
+    async def get_repo(self, repo: str) -> RepoInfo:
+        self.calls.append(("repo", 0))
+        if self.repo_error is not None:
+            raise self.repo_error
+        return RepoInfo(repo, "main", f"https://x/{repo}.git", False)
 
     async def get_issue(self, repo: str, number: int) -> IssueInfo:
         self.calls.append(("issue", number))
-        if self.error is not None:
-            raise self.error
+        self._check(number)
         state = "closed" if number in self.closed else "open"
         return IssueInfo(repo, number, "t", "b", state, "alice", (), False)
 
     async def get_pull_request(self, repo: str, number: int) -> PullRequestInfo:
         self.calls.append(("pr", number))
-        if self.error is not None:
-            raise self.error
+        self._check(number)
         state = "closed" if number in self.closed else "open"
         return PullRequestInfo(
             repo, number, f"https://x/{number}", "omp/b", "main", state, merged=number in self.merged
@@ -216,6 +232,36 @@ async def test_github_error_queues_nothing(settings, db, sandbox) -> None:
 
     assert counts["errors"] == 1 and counts["queued"] == 0
     assert db.claim_next_event() is None
+    assert ws.exists()
+
+
+@pytest.mark.parametrize("status", [404, 410])
+async def test_item_gone_from_github_is_finalized(settings, db, sandbox, status) -> None:
+    """Spam-removed (404) or deleted (410) issues never send a close; they must not leak forever."""
+    db.upsert_issue(key=f"{REPO}#21", repo=REPO, number=21, state="reproducing")
+    _backdate(db, f"{REPO}#21")
+    ws = _make_workspace(sandbox, REPO, 21)
+
+    counts = await _reconciler(settings, db, sandbox, _LiveGitHub(gone={21: status})).tick()
+    await _drain(settings, db, sandbox)
+
+    assert counts["queued"] == 1 and counts["errors"] == 0
+    assert db.get_issue(f"{REPO}#21").state == "closed"
+    assert not ws.exists()
+
+
+async def test_item_404_with_unreadable_repo_is_retried(settings, db, sandbox) -> None:
+    """A 404 from lost repo access is not a deletion."""
+    db.upsert_issue(key=f"{REPO}#21", repo=REPO, number=21, state="reproducing")
+    _backdate(db, f"{REPO}#21")
+    ws = _make_workspace(sandbox, REPO, 21)
+    github = _LiveGitHub(gone={21: 404}, repo_error=GitHubError(404, "Not Found"))
+
+    counts = await _reconciler(settings, db, sandbox, github).tick()
+
+    assert counts["errors"] == 1 and counts["queued"] == 0
+    assert db.claim_next_event() is None
+    assert db.get_issue(f"{REPO}#21").state == "reproducing"
     assert ws.exists()
 
 
