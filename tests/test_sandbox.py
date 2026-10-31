@@ -1915,7 +1915,9 @@ def test_fetch_prune_backfills_default_branch_policy_blob(tmp_path: Path, explic
         git_fetch_prune(pool, token=None, remote_url=f"file://{upstream}")
     else:
         git_fetch_prune(pool, token=None)
-        _git(["-C", str(pool), "remote", "set-url", "origin", "https://example.invalid/missing.git"], cwd=tmp_path)
+    # The policy reader has no credentials, so no remote is reachable for it;
+    # git may also have recorded the explicit URL as a promisor remote.
+    upstream.rename(tmp_path / "upstream-gone.git")
 
     shown = subprocess.run(
         ["git", "-C", str(pool), "show", "refs/remotes/origin/main:.github/omp-maintainer.yml"],
