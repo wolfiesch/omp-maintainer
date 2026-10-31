@@ -115,6 +115,10 @@ _BAD_OBJECT_REF_RE = re.compile(
     r"(?:fatal: bad object (?P<bad>refs/[^\s]+)|error: (?P<invalid>refs/[^\s]+) does not point to a valid object!)"
 )
 _FETCH_PRUNE_REPAIR_ATTEMPTS = 8
+_OID_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+REPO_POLICY_PATH = ".github/omp-maintainer.yml"
+"""Repository policy file, read from ``origin/<default>`` by ``policy.load_repo_policy``."""
 
 _SHARED_OMP_GID = 2000
 _AGENT_HOME = Path("/srv/agent-home")
@@ -212,6 +216,7 @@ def _run_git(
     extra_groups: list[int] | tuple[int, ...] | None = None,
     umask: int | None = None,
     timeout: float | None = None,
+    input: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run `git <args>` with optional PAT injection via `--config-env`.
 
@@ -267,6 +272,7 @@ def _run_git(
             check=False,
             capture_output=True,
             text=True,
+            input=input,
             timeout=effective_timeout,
             **subprocess_kwargs,
         )
@@ -551,13 +557,110 @@ def fetch_prune(
             safe_directory=safe_directory,
         )
         if proc.returncode == 0:
-            return
+            break
         last_proc = proc
         output = f"{proc.stderr}\n{proc.stdout}"
         if not _repair_fetch_prune_failure(repo_dir, output):
             _check(proc, ["git", *args])
-    assert last_proc is not None
-    _check(last_proc, ["git", *args])
+    else:
+        assert last_proc is not None
+        _check(last_proc, ["git", *args])
+    # `load_repo_policy` reads the policy from `origin/<default>` without
+    # credentials, so its blob must be local before any task is prepared.
+    # Best-effort: on failure the policy read fails closed (no mutations).
+    try:
+        _backfill_missing_objects(
+            repo_dir,
+            _remote_policy_blobs(repo_dir, safe_directory=safe_directory),
+            remote=remote_url or "origin",
+            token=token,
+            auth_url=auth_url,
+            extra_env=extra_env,
+            safe_directory=safe_directory,
+        )
+    except GitCommandError as exc:
+        log.warning("policy blob backfill failed", extra={"repo_dir": str(repo_dir), "stderr": exc.stderr})
+
+
+def _remote_policy_blobs(repo_dir: Path, *, safe_directory: Path | None) -> list[str]:
+    """OIDs of ``REPO_POLICY_PATH`` at every ``refs/remotes/origin/*`` tip.
+
+    ``cat-file --batch-check=%(objectname)`` resolves ``<ref>:<path>`` through
+    trees only and never reads the blob, so it cannot trigger a lazy fetch.
+    """
+    refs_args = ["for-each-ref", "--format=%(refname)", "refs/remotes/origin/"]
+    refs = _check(
+        _run_git(refs_args, cwd=repo_dir, token=None, safe_directory=safe_directory),
+        ["git", *refs_args],
+    ).stdout.split()
+    refs = [ref for ref in refs if ref != "refs/remotes/origin/HEAD"]
+    if not refs:
+        return []
+    check_args = ["cat-file", "--batch-check=%(objectname)"]
+    resolved = _check(
+        _run_git(
+            check_args,
+            cwd=repo_dir,
+            token=None,
+            safe_directory=safe_directory,
+            input="".join(f"{ref}:{REPO_POLICY_PATH}\n" for ref in refs),
+        ),
+        ["git", *check_args],
+    ).stdout.splitlines()
+    return sorted({line for line in resolved if _OID_RE.fullmatch(line)})
+
+
+def _backfill_missing_objects(
+    repo_dir: Path,
+    starts: list[str],
+    *,
+    remote: str,
+    token: str | None,
+    auth_url: str | None,
+    extra_env: Mapping[str, str] | None,
+    safe_directory: Path | None,
+) -> None:
+    """Fetch the objects reachable from ``starts`` that the pool lacks.
+
+    ``starts`` are trees or blobs, never commits, so the walk is bounded by
+    one checkout instead of the repository's history. ``rev-list
+    --missing=print`` disables lazy fetching, so the listing never reaches
+    the network. The follow-up fetch mirrors git's own promisor backfill
+    (noop negotiation, OIDs on stdin, FETCH_HEAD untouched) but runs with
+    this call's credentials.
+    """
+    if not starts:
+        return
+    listing_args = ["rev-list", "--objects", "--missing=print", *starts]
+    listing = _check(
+        _run_git(listing_args, cwd=repo_dir, token=None, safe_directory=safe_directory),
+        ["git", *listing_args],
+    )
+    missing = [line[1:].split()[0] for line in listing.stdout.splitlines() if line.startswith("?")]
+    if not missing:
+        return
+    fetch_args = [
+        "-c",
+        "fetch.negotiationAlgorithm=noop",
+        "fetch",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--recurse-submodules=no",
+        "--stdin",
+        remote,
+    ]
+    _check(
+        _run_git(
+            fetch_args,
+            cwd=repo_dir,
+            token=token,
+            auth_url=auth_url,
+            extra_env=extra_env,
+            safe_directory=safe_directory,
+            input="".join(f"{oid}\n" for oid in missing),
+        ),
+        ["git", *fetch_args],
+    )
 
 
 def fetch_ref(
@@ -569,36 +672,37 @@ def fetch_ref(
     auth_url: str | None = None,
     safe_directory: Path | None = None,
 ) -> None:
-    """Fetch ``<ref>`` from origin AND materialize every reachable blob locally.
+    """Fetch ``<ref>`` from origin AND materialize the blobs of its tree.
 
     Callers invoke this immediately before a ``git worktree add`` / checkout
     that needs the working-tree contents, so the blobs MUST be present after
     this returns. ``<repo_dir>`` is typically a ``--filter=blob:none`` partial
-    clone: a plain ``git fetch origin <ref>`` would inherit
-    ``remote.origin.partialclonefilter`` from the pool, bringing the commit
-    and tree but no blobs, leaving the subsequent ``worktree add`` to trigger
-    a lazy promisor fetch — which in proxy-transport deployments has no PAT
-    in the orchestrator process and dies with::
+    clone: a plain ``git fetch origin <ref>`` brings the commit and tree but
+    not every blob, leaving the subsequent ``worktree add`` to trigger a lazy
+    promisor fetch, which in proxy-transport deployments has no PAT in the
+    orchestrator process and dies with::
 
         fatal: could not read Username for 'https://github.com'
         fatal: could not fetch <sha> from promisor remote
 
-    (oh-my-pi#1818). ``--refetch`` forces a fresh negotiation that ignores
-    "we already have this commit", and ``--no-filter`` overrides the inherited
-    filter for this one invocation without touching the on-disk config — so
-    ``fetch_prune`` keeps its cheap blob-skipping semantics on the next pool
-    refresh. Best-effort: a non-zero exit is logged and swallowed because the
-    caller still attempts the checkout (and a stale-ref worktree add will
-    surface a more actionable error than this fetch ever could).
+    (oh-my-pi#1818). The fetch stays incremental and
+    :func:`_backfill_missing_objects` then fills only the checkout's missing
+    blobs; re-downloading the whole repository on every checkout exceeds the
+    broker's git timeout on large repositories. The on-disk partial-clone
+    config is untouched, so ``fetch_prune`` keeps skipping blobs.
+    Best-effort: a non-zero exit is logged and swallowed because the caller
+    still attempts the checkout (and a stale-ref worktree add will surface a
+    more actionable error than this fetch ever could).
     """
     remote = remote_url or "origin"
-    args = ["fetch", "--refetch", "--no-filter", remote, _branch_refspec(ref) if remote_url else ref]
+    args = ["fetch", remote, _branch_refspec(ref) if remote_url else ref]
+    extra_env = _explicit_remote_env(remote_url, cwd=repo_dir)
     proc = _run_git(
         args,
         cwd=repo_dir,
         token=token,
         auth_url=auth_url,
-        extra_env=_explicit_remote_env(remote_url, cwd=repo_dir),
+        extra_env=extra_env,
         safe_directory=safe_directory,
     )
     if proc.returncode != 0:
@@ -606,6 +710,19 @@ def fetch_ref(
             "fetch_ref non-fatal failure",
             extra={"ref": ref, "stderr": proc.stderr},
         )
+        return
+    try:
+        _backfill_missing_objects(
+            repo_dir,
+            ["FETCH_HEAD^{tree}"],
+            remote=remote,
+            token=token,
+            auth_url=auth_url,
+            extra_env=extra_env,
+            safe_directory=safe_directory,
+        )
+    except GitCommandError as exc:
+        log.debug("fetch_ref blob backfill non-fatal failure", extra={"ref": ref, "stderr": exc.stderr})
 
 
 def fetch_pr_head(
@@ -617,29 +734,38 @@ def fetch_pr_head(
     auth_url: str | None = None,
     safe_directory: Path | None = None,
 ) -> None:
-    """Fetch ``refs/pull/<n>/head`` into FETCH_HEAD with all reachable blobs.
+    """Fetch ``refs/pull/<n>/head`` into FETCH_HEAD with its tree's blobs.
 
     Immediately followed by ``git worktree add --detach FETCH_HEAD`` for PR
-    review checkouts. See :func:`fetch_ref` for why ``--refetch --no-filter``
-    is required: without the blob backfill, the worktree-add triggers a
-    promisor lazy fetch that fails under proxy-transport deployments
-    (oh-my-pi#1818).
+    review checkouts. See :func:`fetch_ref` for why the blob backfill is
+    required: without it, the worktree-add triggers a promisor lazy fetch
+    that fails under proxy-transport deployments (oh-my-pi#1818).
     """
     if pr_number <= 0:
         raise ValueError(f"invalid PR number: {pr_number!r}")
     remote = remote_url or "origin"
     ref = f"refs/pull/{pr_number}/head" if remote_url else f"pull/{pr_number}/head"
-    args = ["fetch", "--refetch", "--no-filter", remote, ref]
+    args = ["fetch", remote, ref]
+    extra_env = _explicit_remote_env(remote_url, cwd=repo_dir)
     _check(
         _run_git(
             args,
             cwd=repo_dir,
             token=token,
             auth_url=auth_url,
-            extra_env=_explicit_remote_env(remote_url, cwd=repo_dir),
+            extra_env=extra_env,
             safe_directory=safe_directory,
         ),
         ["git", *args],
+    )
+    _backfill_missing_objects(
+        repo_dir,
+        ["FETCH_HEAD^{tree}"],
+        remote=remote,
+        token=token,
+        auth_url=auth_url,
+        extra_env=extra_env,
+        safe_directory=safe_directory,
     )
 
 

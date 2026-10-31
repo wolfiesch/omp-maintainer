@@ -668,6 +668,15 @@ def _share_git_metadata_with_slots(repo_dir: Path, slot_uid: int | None) -> None
         return
     git_dir, common_dir = dirs
     gid = _SHARED_OMP_GID
+    # A slot resolves `.git` -> `<pool>/<repo>/.git/worktrees/<name>`, so it
+    # must traverse every pool-side directory on that path. The pool root and
+    # its clone root are created by the orchestrator under its own umask
+    # (0700 under `umask 077`), which hides the gitdir from every slot.
+    clone_root = common_dir.parent if common_dir.name == ".git" else common_dir
+    traverse_bits = stat.S_IRGRP | stat.S_IXGRP
+    if clone_root != common_dir:
+        _grant_group_bits(clone_root, gid=gid, bits=traverse_bits)
+    _grant_group_bits(clone_root.parent, gid=gid, bits=traverse_bits)
     _grant_tree(git_dir, gid=gid, files_group_writable=True)
     _grant_group_bits(common_dir, gid=gid, bits=stat.S_IRWXG | stat.S_ISGID)
     for rel, files_group_writable in (
