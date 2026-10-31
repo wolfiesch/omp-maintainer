@@ -120,6 +120,20 @@ def workspace_key(repo: str, number: int | str) -> str:
     return f"{repo.replace('/', '__')}__{number}"
 
 
+def parse_workspace_key(name: str) -> tuple[str, int] | None:
+    """Invert `workspace_key` for per-issue workspaces; None for anything else.
+
+    GitHub owner names cannot contain `_`, so the first `__` ends the owner;
+    the issue number follows the last `__`. Release workspaces and other
+    non-numeric suffixes are not per-issue and return None.
+    """
+    slug, sep, number = name.rpartition("__")
+    owner, sep2, repo = slug.partition("__")
+    if not sep or not sep2 or not owner or not repo or not number.isdigit():
+        return None
+    return f"{owner}/{repo}", int(number)
+
+
 def _safe_directory_env(repo_dir: Path) -> dict[str, str]:
     """Return a Git config env overlay whitelisting ``repo_dir`` as safe."""
     return {
@@ -1188,6 +1202,19 @@ class SandboxManager:
                 count += 1
         return count
 
+    def issue_workspaces(self) -> list[tuple[str, int, Path]]:
+        """List per-issue workspace roots on disk as `(repo, number, path)`."""
+        if not self.root.is_dir():
+            return []
+        found: list[tuple[str, int, Path]] = []
+        for entry in sorted(self.root.iterdir()):
+            if entry.name == "_pool" or entry.name.startswith(".") or not entry.is_dir():
+                continue
+            parsed = parse_workspace_key(entry.name)
+            if parsed is not None:
+                found.append((parsed[0], parsed[1], entry))
+        return found
+
 
 __all__ = [
     "GitCommandError",
@@ -1200,4 +1227,5 @@ __all__ = [
     "validate_branch_slug",
     "redact_credentials",
     "workspace_key",
+    "parse_workspace_key",
 ]

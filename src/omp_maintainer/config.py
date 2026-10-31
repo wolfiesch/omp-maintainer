@@ -212,6 +212,12 @@ class Settings(BaseSettings):
     # `gh_search_issues` then falls back to the remote search API until the
     # repo has a sync watermark.
     issue_index_sync_seconds: float = Field(900.0, alias="OMP_MAINTAINER_ISSUE_INDEX_SYNC_SECONDS")
+    # Closed-item workspace reconcile. Close webhooks can be lost (delivery
+    # failures, ingress outages), and nothing else removes that item's
+    # workspace or finalizes its row. Each pass checks idle unfinished rows and
+    # on-disk workspaces against live GitHub state and queues the missed close
+    # event for anything closed. <= 0 disables the reconciler.
+    workspace_reconcile_seconds: float = Field(3600.0, alias="OMP_MAINTAINER_WORKSPACE_RECONCILE_SECONDS")
 
     # Post-run workspace cache reclamation. Dependency directories such as
     # `node_modules` and workspace-private Bun caches are dead weight between

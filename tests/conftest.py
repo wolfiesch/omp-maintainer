@@ -94,6 +94,8 @@ def _baseline_env(tmp_path: Path) -> dict[str, str]:
         # spin connect-retries against the .invalid proxy URL inside server
         # tests. Tests that want it construct IssueIndexSync directly.
         "OMP_MAINTAINER_ISSUE_INDEX_SYNC_SECONDS": "0",
+        # And for the workspace reconciler. Tests construct it directly.
+        "OMP_MAINTAINER_WORKSPACE_RECONCILE_SECONDS": "0",
     }
 
 

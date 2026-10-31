@@ -70,6 +70,7 @@ class PullRequestInfo:
     title: str = ""
     body: str = ""
     head_sha: str = ""
+    merged: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -979,6 +980,7 @@ def _pr_from_payload(repo: str, data: Mapping[str, Any]) -> PullRequestInfo:
         title=str(data.get("title") or ""),
         body=str(data.get("body") or ""),
         head_sha=str(head.get("sha") or "") if isinstance(head, Mapping) else "",
+        merged=bool(data.get("merged") or data.get("merged_at")),
     )
 
 
