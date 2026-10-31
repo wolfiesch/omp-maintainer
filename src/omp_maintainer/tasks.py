@@ -255,6 +255,38 @@ async def _resolve_repo_and_issue(
     return repo, issue
 
 
+async def _issue_still_open(github: GitHubBackend, repo_full: str, number: int) -> bool:
+    """Live open/closed gate for work that would (re)build a workspace.
+
+    Payloads carry the state from delivery time, and a retried event replays
+    that payload. A retry that runs after the close event's cleanup would
+    otherwise rebuild the workspace and reset the row of an item that is
+    already closed, and no further close event arrives to remove it again.
+    Fails open on a GitHub error so a transient API fault cannot drop work.
+    """
+    try:
+        live = await github.get_issue(repo_full, number)
+    except GitHubError as exc:
+        log.warning(
+            "live issue state check failed; proceeding", extra={"repo": repo_full, "n": number, "err": str(exc)}
+        )
+        return True
+    return live.state == "open"
+
+
+async def _pr_still_open(github: GitHubBackend, repo_full: str, pr_number: int, known: PullRequestInfo | None) -> bool:
+    """`_issue_still_open` for a PR, reusing already-fetched PR metadata."""
+    if known is None:
+        try:
+            known = await github.get_pull_request(repo_full, pr_number)
+        except GitHubError as exc:
+            log.warning(
+                "live PR state check failed; proceeding", extra={"repo": repo_full, "pr": pr_number, "err": str(exc)}
+            )
+            return True
+    return known.state == "open"
+
+
 async def _resolve_issue_row_for_pr(
     *,
     db: Database,
@@ -539,6 +571,9 @@ async def triage_issue(
         log.info("skip: triage on PR-like issue", extra={"repo": repo.full_name, "n": issue.number})
         return
     key = issue_key(repo.full_name, issue.number)
+    if not await _issue_still_open(github, repo.full_name, issue.number):
+        log.info("skip: triage on closed issue", extra={"key": key, "attempts": attempts})
+        return
     existing = db.get_issue(key)
     if existing is None:
         # First-time triage: bail if a PR (human or another bot) already
@@ -629,6 +664,9 @@ async def review_pr(
         pr = await github.get_pull_request(repo_full, pr_number)
     except GitHubError as exc:
         log.warning("review_pr fetch failed", extra={"repo": repo_full, "pr": pr_number, "err": str(exc)})
+        return
+    if pr.state != "open":
+        log.info("skip: review on closed PR", extra={"repo": repo_full, "pr": pr_number, "attempts": attempts})
         return
 
     labels = {label.lower() for label in issue.labels}
@@ -855,6 +893,9 @@ async def handle_review(
             return
         issue_number = issue_row.number
         existing_branch = issue_row.branch
+    if not await _pr_still_open(github, repo_full, pr_number, pr_info):
+        log.info("skip: review comment on closed PR", extra={"repo": repo_full, "pr": pr_number, "attempts": attempts})
+        return
     try:
         repo = await github.get_repo(repo_full)
         issue = await github.get_issue(repo_full, issue_number)
@@ -945,10 +986,15 @@ async def handle_pr_conversation(
         repo_full=repo_full,
         pr_number=pr_number,
     )
+    directive = _directive_from_payload(payload)
     if issue_row is None:
         if pr_info is None or not _can_handle_pr_directly(settings=settings, repo_full=repo_full, pr=pr_info):
             return
-    directive = _directive_from_payload(payload)
+        if pr_info.state != "open" and directive is None:
+            # Untracked PR: no row means no close event will ever clean up a
+            # workspace built here. Only a maintainer directive may work on it.
+            log.info("skip: pr-conversation on closed untracked PR", extra={"repo": repo_full, "pr": pr_number})
+            return
     if issue_row is not None and issue_row.state == "reviewing":
         log.info("skip: incoming PR conversation unsupported", extra={"key": issue_row.key, "pr": pr_number})
         return
@@ -1078,6 +1124,9 @@ async def cleanup_workspace(
     else:
         issue_row = db.get_issue(issue_key(repo_full, number))
     if issue_row is None:
+        # No row: an earlier attempt failed inside workspace setup, before the
+        # handler persisted one. Drop anything left under this item's number.
+        await _run_workspace_op(sandbox.remove_workspace, repo=repo_full, number=number)
         return
     await _run_workspace_op(sandbox.remove_workspace, repo=issue_row.repo, number=issue_row.number)
     db.set_issue_state(issue_row.key, target_state)

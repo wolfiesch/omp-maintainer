@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -2662,8 +2663,9 @@ async def test_directive_handler_attaches_thread_from_github(
 class _StubGithubForTriage:
     """Minimal `GitHubBackend` shim for triage_issue tests."""
 
-    def __init__(self, closing_prs: tuple[int, ...] | Exception = ()) -> None:
+    def __init__(self, closing_prs: tuple[int, ...] | Exception = (), *, live_state: str = "open") -> None:
         self._closing_prs = closing_prs
+        self._live_state = live_state
         self.calls: list[tuple[str, int]] = []
 
     async def list_closing_pull_requests(self, repo: str, number: int) -> tuple[int, ...]:
@@ -2671,6 +2673,9 @@ class _StubGithubForTriage:
         if isinstance(self._closing_prs, Exception):
             raise self._closing_prs
         return self._closing_prs
+
+    async def get_issue(self, repo: str, number: int):
+        return SimpleNamespace(state=self._live_state)
 
 
 async def test_triage_issue_skips_when_a_closing_pr_already_exists(
@@ -2855,6 +2860,207 @@ async def test_triage_issue_does_not_recheck_when_issue_row_exists(
 
     assert github.calls == [], "MUST NOT query timeline on a repeat-triage"
     assert len(stub_run_task) == 1
+    close_database()
+
+
+# ---------- work events replayed after the item closed ----------
+#
+# A failed first attempt schedules a retry that stays `queued`, so the close
+# event can run cleanup before it. The retry replays the delivery-time payload
+# (still "open"); it must not rebuild the workspace or revive the row, since no
+# second close event will arrive to remove it.
+
+
+class _ClosedItemGithub:
+    """GitHub shim whose live view reports the item closed."""
+
+    def __init__(self, *, pr_number: int = 900) -> None:
+        from omp_maintainer.github_client import PullRequestInfo
+
+        self.pr = PullRequestInfo(
+            repo="octo/widget",
+            number=pr_number,
+            html_url=f"https://github.com/octo/widget/pull/{pr_number}",
+            head_ref="omp/fix-parser",
+            base_ref="main",
+            state="closed",
+            author="alice",
+            head_repo="octo/widget",
+        )
+
+    async def get_issue(self, repo: str, number: int):
+        return SimpleNamespace(state="closed")
+
+    async def get_pull_request(self, repo: str, number: int):
+        return self.pr
+
+    async def get_repo(self, repo: str):
+        raise AssertionError("closed item must be skipped before repo metadata is fetched")
+
+    async def list_closing_pull_requests(self, repo: str, number: int) -> tuple[int, ...]:
+        raise AssertionError("closed issue must be skipped before the closing-PR check")
+
+
+async def test_review_pr_retry_after_close_keeps_item_finalized(
+    settings: Settings, tmp_path: Path, stub_run_task, monkeypatch
+) -> None:
+    from omp_maintainer import tasks
+    from omp_maintainer.github_client import GitHubClient, IssueInfo, RepoInfo
+
+    sandbox = _RecordingSandbox(tmp_path)
+    db = get_database(settings.sqlite_path)
+    key = issue_key("octo/widget", 900)
+    db.upsert_issue(key=key, repo="octo/widget", number=900, state="merged", pr_number=900)
+    closed = _ClosedItemGithub()
+
+    async def _get_repo(self, repo_full: str):
+        return RepoInfo(
+            full_name=repo_full, default_branch="main", clone_url="https://x/octo/widget.git", private=False
+        )
+
+    async def _get_issue(self, repo_full: str, number: int):
+        return IssueInfo(
+            repo=repo_full,
+            number=number,
+            title="Fix parser",
+            body="body",
+            state="closed",
+            author="alice",
+            labels=(),
+            is_pull_request=True,
+        )
+
+    async def _get_pull_request(self, repo_full: str, number: int):
+        return closed.pr
+
+    monkeypatch.setattr(GitHubClient, "get_repo", _get_repo)
+    monkeypatch.setattr(GitHubClient, "get_issue", _get_issue)
+    monkeypatch.setattr(GitHubClient, "get_pull_request", _get_pull_request)
+
+    await tasks.review_pr(
+        settings=settings,
+        db=db,
+        github=GitHubClient("t"),
+        sandbox=sandbox,
+        git_transport=LocalGitTransport(token=None),
+        payload={"action": "opened", "pull_request": {"number": 900}, "repository": {"full_name": "octo/widget"}},
+        delivery_id="d-review-after-close",
+        attempts=2,
+    )
+
+    assert sandbox.ensure_calls == []
+    assert stub_run_task == []
+    row = db.get_issue(key)
+    assert row is not None and row.state == "merged"
+    close_database()
+
+
+async def test_triage_issue_retry_after_close_does_not_reopen(
+    settings: Settings, tmp_path: Path, stub_run_task, monkeypatch
+) -> None:
+    """A replayed `issues.opened` on a closed issue is not a reopen: no teardown, no rebuild."""
+    from omp_maintainer import tasks
+    from omp_maintainer.github_client import IssueInfo, RepoInfo
+
+    sandbox = _RecordingSandbox(tmp_path)
+    db = get_database(settings.sqlite_path)
+    db.upsert_issue(key="octo/widget#12", repo="octo/widget", number=12, state="closed")
+    repo = RepoInfo(
+        full_name="octo/widget", default_branch="main", clone_url="https://github.com/octo/widget.git", private=False
+    )
+    stale_payload_issue = IssueInfo(
+        repo="octo/widget",
+        number=12,
+        title="x",
+        body="y",
+        state="open",
+        author="alice",
+        labels=(),
+        is_pull_request=False,
+    )
+
+    async def _resolve(_gh, _payload):
+        return repo, stale_payload_issue
+
+    monkeypatch.setattr(tasks, "_resolve_repo_and_issue", _resolve)
+
+    await tasks.triage_issue(
+        settings=settings,
+        db=db,
+        github=_ClosedItemGithub(),  # type: ignore[arg-type]
+        git_transport=LocalGitTransport(token=None),
+        sandbox=sandbox,  # type: ignore[arg-type]
+        payload={"action": "opened", "issue": {"number": 12}, "repository": {"full_name": "octo/widget"}},
+        delivery_id="t-after-close",
+        attempts=2,
+    )
+
+    assert sandbox.ensure_calls == []
+    assert sandbox.remove_calls == []
+    assert stub_run_task == []
+    row = db.get_issue("octo/widget#12")
+    assert row is not None and row.state == "closed"
+    close_database()
+
+
+async def test_handle_review_retry_after_merge_skips_workspace(
+    settings: Settings, tmp_path: Path, stub_run_task
+) -> None:
+    from omp_maintainer import tasks
+
+    sandbox = _RecordingSandbox(tmp_path)
+    db = get_database(settings.sqlite_path)
+    db.upsert_issue(
+        key="octo/widget#40",
+        repo="octo/widget",
+        number=40,
+        state="merged",
+        branch="omp/fix-parser",
+        pr_number=900,
+    )
+
+    await tasks.handle_review(
+        settings=settings,
+        db=db,
+        github=_ClosedItemGithub(),  # type: ignore[arg-type]
+        git_transport=LocalGitTransport(token=None),
+        sandbox=sandbox,  # type: ignore[arg-type]
+        payload={
+            "action": "created",
+            "pull_request": {"number": 900},
+            "repository": {"full_name": "octo/widget"},
+            "comment": {"user": {"login": "alice"}, "body": "nit", "path": "a.py", "line": 1},
+        },
+        delivery_id="r-after-merge",
+        attempts=2,
+    )
+
+    assert sandbox.ensure_calls == []
+    assert stub_run_task == []
+    close_database()
+
+
+async def test_cleanup_without_issue_row_removes_leftover_workspace(settings: Settings, tmp_path: Path) -> None:
+    """A first attempt that failed inside workspace setup leaves a directory but no row."""
+    from omp_maintainer import tasks
+
+    sandbox = _RecordingSandbox(tmp_path)
+    db = get_database(settings.sqlite_path)
+
+    await tasks.cleanup_workspace(
+        settings=settings,
+        db=db,
+        sandbox=sandbox,  # type: ignore[arg-type]
+        payload={
+            "action": "closed",
+            "pull_request": {"number": 900, "merged": True},
+            "repository": {"full_name": "octo/widget"},
+        },
+        target_state="merged",
+    )
+
+    assert sandbox.remove_calls == [("octo/widget", 900)]
+    assert db.get_issue(issue_key("octo/widget", 900)) is None
     close_database()
 
 
