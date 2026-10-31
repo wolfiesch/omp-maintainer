@@ -12,12 +12,19 @@ Each tick collects two kinds of candidates for allowlisted repos:
 
 Candidates touched within `min_idle`, or with a queued/running event, are left
 alone. For the rest the live GitHub state decides:
-  - A row linked to a PR follows the PR: once it is closed, the missed
-    `pull_request.closed` is queued. While the PR is open nothing happens,
+  - A row linked to a PR follows the PR: while it is open nothing happens,
     even if the issue itself was closed, because review follow-ups on that PR
-    still need the workspace.
+    still need the workspace. Once it is closed, the missed
+    `pull_request.closed` is queued, but for an issue row linked to a
+    separate PR only when the issue is closed too. An open issue behind a
+    closed PR is live work (typically a reopen, which keeps the stale
+    `pr_number`), and cleaning it up through the old PR would delete it.
   - Otherwise the item's own number decides: once closed, the missed
     `issues.closed` is queued.
+
+Any activity on the key between the idle check and the enqueue (a webhook or
+maintainer directive arriving during the GitHub round trip) cancels the
+enqueue; the check is atomic with the insert.
 
 The synthesized event goes through the durable queue under the same issue key
 the webhook router would assign, so it serializes with any other work on that
@@ -34,7 +41,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from omp_maintainer.config import Settings
-from omp_maintainer.db import INACTIVE_EVENT_STATES, Database, IssueRow, issue_key
+from omp_maintainer.db import INACTIVE_EVENT_STATES, Database, IssueRow, format_timestamp, issue_key
 from omp_maintainer.github_backend import GitHubBackend
 from omp_maintainer.github_client import GitHubError
 from omp_maintainer.sandbox import SandboxManager, workspace_key
@@ -151,6 +158,7 @@ class WorkspaceReconciler:
     async def tick(self) -> dict[str, int]:
         """Check every candidate once and queue missed close events. Exposed for tests."""
         now = datetime.now(UTC)
+        idle_since = format_timestamp(now - self._min_idle)
         counts = {"queued": 0, "open": 0, "active": 0, "recent": 0, "errors": 0}
         for cand in await asyncio.to_thread(self._candidates):
             if now - cand.last_activity < self._min_idle:
@@ -171,7 +179,7 @@ class WorkspaceReconciler:
             if missed is None:
                 counts["open"] += 1
                 continue
-            if self._enqueue(cand, missed):
+            if self._enqueue(cand, missed, idle_since=idle_since):
                 counts["queued"] += 1
         if counts["queued"]:
             self._wake()
@@ -213,6 +221,10 @@ class WorkspaceReconciler:
             pr = await self._github.get_pull_request(cand.repo, pr_number)
             if pr.state != "closed":
                 return None
+            if cand.number != pr_number:
+                issue = await self._github.get_issue(cand.repo, cand.number)
+                if issue.state != "closed":
+                    return None
             # Same key the router assigns a `pull_request.closed` delivery.
             linked = self._db.find_issue_by_pr(cand.repo, pr_number)
             return _MissedClose(
@@ -235,7 +247,7 @@ class WorkspaceReconciler:
             payload={"action": "closed", "issue": {"number": cand.number}, "repository": repository},
         )
 
-    def _enqueue(self, cand: _Candidate, missed: _MissedClose) -> bool:
+    def _enqueue(self, cand: _Candidate, missed: _MissedClose, *, idle_since: str) -> bool:
         delivery_id = reconcile_delivery_id(missed.event_type, cand.repo, missed.number)
         queued = self._db.replace_event_if_state_in(
             delivery_id=delivery_id,
@@ -245,10 +257,10 @@ class WorkspaceReconciler:
             payload=missed.payload,
             state="queued",
             allowed_existing_states=INACTIVE_EVENT_STATES,
-            # A webhook (e.g. a reopen) may have landed during the GitHub round
+            # A webhook or directive may have landed during the GitHub round
             # trip; re-check in the insert's transaction so a stale close never
-            # queues behind it.
-            require_idle_key=True,
+            # queues behind (or after) fresh work.
+            idle_since=idle_since,
         )
         if queued:
             log.info(

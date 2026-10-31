@@ -121,7 +121,8 @@ async def test_lost_merge_of_linked_pr_removes_workspace_and_marks_merged(settin
     ws = _make_workspace(sandbox, REPO, 40)
     wake = _Wake()
 
-    counts = await _reconciler(settings, db, sandbox, _LiveGitHub(merged={41}), wake).tick()
+    # `Fixes #40` closes the issue alongside the merge; both webhooks were lost.
+    counts = await _reconciler(settings, db, sandbox, _LiveGitHub(merged={41}, closed={40}), wake).tick()
 
     assert counts["queued"] == 1 and wake.count == 1
     assert await _drain(settings, db, sandbox) == [f"reconcile-pull_request-{workspace_key(REPO, 41)}"]
@@ -159,6 +160,19 @@ async def test_open_pr_keeps_workspace_even_when_issue_closed(settings, db, sand
     counts = await _reconciler(settings, db, sandbox, _LiveGitHub(closed={40})).tick()
 
     assert counts == {"queued": 0, "open": 1, "active": 0, "recent": 0, "errors": 0}
+    assert db.claim_next_event() is None
+    assert ws.exists()
+
+
+async def test_reopened_issue_with_stale_closed_pr_link_is_kept(settings, db, sandbox) -> None:
+    """A reopen keeps the old `pr_number`; the old PR's close must not clean the live issue."""
+    db.upsert_issue(key=f"{REPO}#50", repo=REPO, number=50, state="reproducing", pr_number=51)
+    _backdate(db, f"{REPO}#50")
+    ws = _make_workspace(sandbox, REPO, 50)
+
+    counts = await _reconciler(settings, db, sandbox, _LiveGitHub(merged={51})).tick()
+
+    assert counts["open"] == 1 and counts["queued"] == 0
     assert db.claim_next_event() is None
     assert ws.exists()
 
@@ -250,6 +264,23 @@ async def test_webhook_landing_during_state_check_wins(settings, db, sandbox) ->
 
     assert counts["queued"] == 0
     assert db.get_event(reconcile_delivery_id("issues", REPO, 30)) is None
+
+
+async def test_directive_finishing_during_state_check_wins(settings, db, sandbox) -> None:
+    """Work that starts and ends inside the GitHub round trip leaves only a row update behind."""
+    db.upsert_issue(key=f"{REPO}#31", repo=REPO, number=31, state="closed")
+    _backdate(db, f"{REPO}#31")
+    _make_workspace(sandbox, REPO, 31)
+
+    class _DirectiveDuringCheck(_LiveGitHub):
+        async def get_issue(self, repo: str, number: int) -> IssueInfo:
+            db.upsert_issue(key=f"{REPO}#31", repo=REPO, number=31, state="closed")
+            return await super().get_issue(repo, number)
+
+    counts = await _reconciler(settings, db, sandbox, _DirectiveDuringCheck(closed={31})).tick()
+
+    assert counts["queued"] == 0
+    assert db.get_event(reconcile_delivery_id("issues", REPO, 31)) is None
 
 
 @pytest.mark.parametrize(

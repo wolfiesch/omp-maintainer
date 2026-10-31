@@ -195,8 +195,13 @@ CREATE TABLE IF NOT EXISTS issue_index_sync (
 """
 
 
+def format_timestamp(moment: datetime) -> str:
+    """The UTC text form every `*_at` column stores; compares lexicographically."""
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def _utcnow() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return format_timestamp(datetime.now(UTC))
 
 
 def _utc_after(seconds: float) -> str:
@@ -578,12 +583,15 @@ class Database:
         payload: Mapping[str, Any],
         state: EventState = "queued",
         allowed_existing_states: tuple[EventState, ...],
-        require_idle_key: bool = False,
+        idle_since: str | None = None,
     ) -> bool:
         """Replace an existing event only when its current state is permitted.
 
-        With `require_idle_key`, also refuse while any other queued or running
-        event targets `issue_key`, checked in the same transaction as the insert.
+        With `idle_since` (a `_utcnow()`-format timestamp), also refuse when
+        `issue_key` saw any activity after it: another event for the key that
+        is queued or running, or was received or finished after the cutoff, or
+        an issue-row update after the cutoff. Checked in the same transaction
+        as the insert.
         """
         now = _utcnow()
         with self._txn() as conn:
@@ -594,11 +602,17 @@ class Database:
             if row is not None:
                 if row["state"] not in allowed_existing_states:
                     return False
-            if require_idle_key and issue_key is not None:
+            if idle_since is not None and issue_key is not None:
                 busy = conn.execute(
-                    "SELECT 1 FROM events WHERE issue_key = ? AND state IN ('queued','running') "
-                    "AND delivery_id <> ? LIMIT 1",
-                    (issue_key, delivery_id),
+                    """
+                    SELECT 1 FROM events
+                    WHERE issue_key = ? AND delivery_id <> ?
+                      AND (state IN ('queued','running') OR received_at > ? OR finished_at > ?)
+                    UNION ALL
+                    SELECT 1 FROM issues WHERE key = ? AND updated_at > ?
+                    LIMIT 1
+                    """,
+                    (issue_key, delivery_id, idle_since, idle_since, issue_key, idle_since),
                 ).fetchone()
                 if busy is not None:
                     return False
