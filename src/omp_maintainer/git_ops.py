@@ -212,6 +212,7 @@ def _run_git(
     extra_groups: list[int] | tuple[int, ...] | None = None,
     umask: int | None = None,
     timeout: float | None = None,
+    input: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run `git <args>` with optional PAT injection via `--config-env`.
 
@@ -267,6 +268,7 @@ def _run_git(
             check=False,
             capture_output=True,
             text=True,
+            input=input,
             timeout=effective_timeout,
             **subprocess_kwargs,
         )
@@ -560,6 +562,56 @@ def fetch_prune(
     _check(last_proc, ["git", *args])
 
 
+def _backfill_tree_blobs(
+    repo_dir: Path,
+    rev: str,
+    *,
+    remote: str,
+    token: str | None,
+    auth_url: str | None,
+    extra_env: Mapping[str, str] | None,
+    safe_directory: Path | None,
+) -> None:
+    """Fetch exactly the blobs ``rev``'s tree needs that the pool lacks.
+
+    ``rev-list --missing=print`` disables lazy fetching, so the listing never
+    reaches the network. The follow-up fetch mirrors git's own promisor
+    backfill (noop negotiation, OIDs on stdin, FETCH_HEAD untouched) but runs
+    with this call's credentials, so the cost is bounded by one checkout
+    instead of the repository's full history.
+    """
+    listing_args = ["rev-list", "--objects", "--missing=print", f"{rev}^{{tree}}"]
+    listing = _check(
+        _run_git(listing_args, cwd=repo_dir, token=None, safe_directory=safe_directory),
+        ["git", *listing_args],
+    )
+    missing = [line[1:].split()[0] for line in listing.stdout.splitlines() if line.startswith("?")]
+    if not missing:
+        return
+    fetch_args = [
+        "-c",
+        "fetch.negotiationAlgorithm=noop",
+        "fetch",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--recurse-submodules=no",
+        "--stdin",
+        remote,
+    ]
+    _check(
+        _run_git(
+            fetch_args,
+            cwd=repo_dir,
+            token=token,
+            auth_url=auth_url,
+            extra_env=extra_env,
+            safe_directory=safe_directory,
+            input="".join(f"{oid}\n" for oid in missing),
+        ),
+        ["git", *fetch_args],
+    )
+
+
 def fetch_ref(
     repo_dir: Path,
     ref: str,
@@ -569,36 +621,37 @@ def fetch_ref(
     auth_url: str | None = None,
     safe_directory: Path | None = None,
 ) -> None:
-    """Fetch ``<ref>`` from origin AND materialize every reachable blob locally.
+    """Fetch ``<ref>`` from origin AND materialize the blobs of its tree.
 
     Callers invoke this immediately before a ``git worktree add`` / checkout
     that needs the working-tree contents, so the blobs MUST be present after
     this returns. ``<repo_dir>`` is typically a ``--filter=blob:none`` partial
-    clone: a plain ``git fetch origin <ref>`` would inherit
-    ``remote.origin.partialclonefilter`` from the pool, bringing the commit
-    and tree but no blobs, leaving the subsequent ``worktree add`` to trigger
-    a lazy promisor fetch — which in proxy-transport deployments has no PAT
-    in the orchestrator process and dies with::
+    clone: a plain ``git fetch origin <ref>`` brings the commit and tree but
+    not every blob, leaving the subsequent ``worktree add`` to trigger a lazy
+    promisor fetch, which in proxy-transport deployments has no PAT in the
+    orchestrator process and dies with::
 
         fatal: could not read Username for 'https://github.com'
         fatal: could not fetch <sha> from promisor remote
 
-    (oh-my-pi#1818). ``--refetch`` forces a fresh negotiation that ignores
-    "we already have this commit", and ``--no-filter`` overrides the inherited
-    filter for this one invocation without touching the on-disk config — so
-    ``fetch_prune`` keeps its cheap blob-skipping semantics on the next pool
-    refresh. Best-effort: a non-zero exit is logged and swallowed because the
-    caller still attempts the checkout (and a stale-ref worktree add will
-    surface a more actionable error than this fetch ever could).
+    (oh-my-pi#1818). The fetch stays incremental and
+    :func:`_backfill_tree_blobs` then fills only the checkout's missing
+    blobs; re-downloading the whole repository on every checkout exceeds the
+    broker's git timeout on large repositories. The on-disk partial-clone
+    config is untouched, so ``fetch_prune`` keeps skipping blobs.
+    Best-effort: a non-zero exit is logged and swallowed because the caller
+    still attempts the checkout (and a stale-ref worktree add will surface a
+    more actionable error than this fetch ever could).
     """
     remote = remote_url or "origin"
-    args = ["fetch", "--refetch", "--no-filter", remote, _branch_refspec(ref) if remote_url else ref]
+    args = ["fetch", remote, _branch_refspec(ref) if remote_url else ref]
+    extra_env = _explicit_remote_env(remote_url, cwd=repo_dir)
     proc = _run_git(
         args,
         cwd=repo_dir,
         token=token,
         auth_url=auth_url,
-        extra_env=_explicit_remote_env(remote_url, cwd=repo_dir),
+        extra_env=extra_env,
         safe_directory=safe_directory,
     )
     if proc.returncode != 0:
@@ -606,6 +659,19 @@ def fetch_ref(
             "fetch_ref non-fatal failure",
             extra={"ref": ref, "stderr": proc.stderr},
         )
+        return
+    try:
+        _backfill_tree_blobs(
+            repo_dir,
+            "FETCH_HEAD",
+            remote=remote,
+            token=token,
+            auth_url=auth_url,
+            extra_env=extra_env,
+            safe_directory=safe_directory,
+        )
+    except GitCommandError as exc:
+        log.debug("fetch_ref blob backfill non-fatal failure", extra={"ref": ref, "stderr": exc.stderr})
 
 
 def fetch_pr_head(
@@ -617,29 +683,38 @@ def fetch_pr_head(
     auth_url: str | None = None,
     safe_directory: Path | None = None,
 ) -> None:
-    """Fetch ``refs/pull/<n>/head`` into FETCH_HEAD with all reachable blobs.
+    """Fetch ``refs/pull/<n>/head`` into FETCH_HEAD with its tree's blobs.
 
     Immediately followed by ``git worktree add --detach FETCH_HEAD`` for PR
-    review checkouts. See :func:`fetch_ref` for why ``--refetch --no-filter``
-    is required: without the blob backfill, the worktree-add triggers a
-    promisor lazy fetch that fails under proxy-transport deployments
-    (oh-my-pi#1818).
+    review checkouts. See :func:`fetch_ref` for why the blob backfill is
+    required: without it, the worktree-add triggers a promisor lazy fetch
+    that fails under proxy-transport deployments (oh-my-pi#1818).
     """
     if pr_number <= 0:
         raise ValueError(f"invalid PR number: {pr_number!r}")
     remote = remote_url or "origin"
     ref = f"refs/pull/{pr_number}/head" if remote_url else f"pull/{pr_number}/head"
-    args = ["fetch", "--refetch", "--no-filter", remote, ref]
+    args = ["fetch", remote, ref]
+    extra_env = _explicit_remote_env(remote_url, cwd=repo_dir)
     _check(
         _run_git(
             args,
             cwd=repo_dir,
             token=token,
             auth_url=auth_url,
-            extra_env=_explicit_remote_env(remote_url, cwd=repo_dir),
+            extra_env=extra_env,
             safe_directory=safe_directory,
         ),
         ["git", *args],
+    )
+    _backfill_tree_blobs(
+        repo_dir,
+        "FETCH_HEAD",
+        remote=remote,
+        token=token,
+        auth_url=auth_url,
+        extra_env=extra_env,
+        safe_directory=safe_directory,
     )
 
 

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import platform
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -1036,6 +1038,49 @@ async def test_git_fetch_github_origin_uses_explicit_scoped_remote(
     assert captured["remote_url"] == "https://github.com/octo/widget.git"
     assert captured["token"] == _TOKEN
     assert captured["auth_url"] == "https://github.com/octo/widget.git"
+
+
+async def test_git_timeout_keeps_repo_serialized_until_git_exits(
+    proxy_settings: Settings, upstream_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 504 must not free the pool for the next request while the timed-out
+    git process is still writing to it; overlapping fetches corrupt and bloat
+    the shared object store."""
+    _stage_pool(proxy_settings, upstream_repo)
+    proxy_settings.gh_proxy_git_timeout_seconds = 0.05
+    release = threading.Event()
+    events: list[str] = []
+
+    def fake_fetch_pr_head(path: Path, pr_number: int, **kwargs: object) -> None:
+        events.append(f"start-{pr_number}")
+        if pr_number == 1:
+            assert release.wait(5.0)
+        events.append(f"end-{pr_number}")
+
+    monkeypatch.setattr("omp_maintainer.proxy.server.git_fetch_pr_head", fake_fetch_pr_head)
+    app = _build_app(proxy_settings)
+
+    async def post(pr_number: int) -> httpx.Response:
+        body = json.dumps({"repo": "octo/widget", "pr_number": pr_number}).encode()
+        return await client.post(
+            "/gh/v1/git/fetch_pr_head",
+            content=body,
+            headers={**_signed("POST", "/gh/v1/git/fetch_pr_head", body), "Content-Type": "application/json"},
+        )
+
+    async with await _async_client(app) as client:
+        first = asyncio.create_task(post(1))
+        while events != ["start-1"]:
+            await asyncio.sleep(0.01)
+        second = asyncio.create_task(post(2))
+        await asyncio.sleep(0.2)
+        assert events == ["start-1"], "second fetch ran beside the timed-out one"
+        release.set()
+        first_resp, second_resp = await asyncio.gather(first, second)
+
+    assert first_resp.status_code == 504, first_resp.text
+    assert second_resp.status_code == 200, second_resp.text
+    assert events == ["start-1", "end-1", "start-2", "end-2"]
 
 
 async def test_git_push_happy_path(proxy_settings: Settings, upstream_repo: Path) -> None:

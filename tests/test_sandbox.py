@@ -5,6 +5,7 @@ import platform
 import signal
 import stat
 import subprocess
+import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -930,6 +931,11 @@ def test_share_git_metadata_keeps_pool_writable_for_retry_slot(tmp_path: Path, m
     index_file.write_text("index\n", encoding="utf-8")
     index_file.chmod(0o600)
 
+    # Orchestrator-created pool directories start private under `umask 077`.
+    clone_root = common_dir.parent
+    clone_root.chmod(0o700)
+    clone_root.parent.chmod(0o700)
+
     chowns: list[tuple[Path, int, int]] = []
     monkeypatch.setattr("omp_maintainer.sandbox.platform.system", lambda: "Linux")
     monkeypatch.setattr("omp_maintainer.sandbox.os.geteuid", lambda: 0)
@@ -944,6 +950,10 @@ def test_share_git_metadata_keeps_pool_writable_for_retry_slot(tmp_path: Path, m
     assert ref_file.stat().st_mode & stat.S_IWGRP
     assert log_file.stat().st_mode & stat.S_IWGRP
     assert index_file.stat().st_mode & stat.S_IWGRP
+    for pool_dir in (clone_root, clone_root.parent):
+        mode = pool_dir.stat().st_mode
+        assert mode & stat.S_IRGRP and mode & stat.S_IXGRP, oct(mode)
+        assert not mode & stat.S_IWGRP, oct(mode)
     assert (git_dir, -1, 2000) in chowns
 
 
@@ -1670,7 +1680,7 @@ def _partial_clone_upstream(tmp_path: Path) -> Path:
 
 def _commit_new_blob_upstream(upstream: Path, tmp_path: Path, *, path: str, content: str, ref: str = "main") -> str:
     """Add a fresh blob upstream and return the new commit SHA."""
-    contrib = tmp_path / f"contrib-{path.replace('/', '_')}"
+    contrib = Path(tempfile.mkdtemp(prefix=f"contrib-{path.replace('/', '_')}-", dir=tmp_path))
     _git(["clone", f"file://{upstream}", str(contrib)], cwd=tmp_path)
     (contrib / path).write_text(content, encoding="utf-8")
     _git(["-C", str(contrib), "add", path], cwd=tmp_path)
@@ -1812,6 +1822,69 @@ def test_fetch_pr_head_backfills_missing_blobs_into_partial_clone(tmp_path: Path
         env=os.environ | {"GIT_TERMINAL_PROMPT": "0"},
     )
     assert (ws_dir / "pr.txt").read_text(encoding="utf-8") == "pr blob payload\n"
+
+
+@pytest.mark.parametrize("explicit_remote", [False, True], ids=["origin", "explicit-url"])
+@pytest.mark.parametrize("op", ["fetch_ref", "fetch_pr_head"])
+def test_checkout_fetch_backfills_only_target_tree(tmp_path: Path, op: str, explicit_remote: bool) -> None:
+    """The pre-checkout fetch fills the target tree without re-downloading
+    history: a blob that only exists in an older commit stays promisor-deferred.
+    Re-fetching the whole repository on every checkout timed out the broker on
+    large repositories. ``explicit_remote`` mirrors the broker, which fetches
+    from a credential-scoped URL instead of the ``origin`` promisor remote."""
+    upstream = _partial_clone_upstream(tmp_path)
+    old_sha = _commit_new_blob_upstream(upstream, tmp_path, path="history.txt", content="old history\n")
+    pool = tmp_path / "pool"
+    _git(
+        [
+            "clone",
+            "--filter=blob:none",
+            "--no-tags",
+            "--no-checkout",
+            "--branch",
+            "main",
+            f"file://{upstream}",
+            str(pool),
+        ],
+        cwd=tmp_path,
+    )
+    old_blob = subprocess.run(
+        ["git", "-C", str(pool), "rev-parse", f"{old_sha}:history.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _commit_new_blob_upstream(upstream, tmp_path, path="history.txt", content="new history\n")
+    ref = "refs/pull/9/head" if op == "fetch_pr_head" else "main"
+    target_sha = _commit_new_blob_upstream(upstream, tmp_path, path="target.txt", content="target\n", ref=ref)
+
+    remote_url = f"file://{upstream}" if explicit_remote else None
+    if op == "fetch_pr_head":
+        git_fetch_pr_head(pool, 9, token=None, remote_url=remote_url)
+    else:
+        git_fetch_ref(pool, "main", token=None, remote_url=remote_url)
+
+    fetched = subprocess.run(
+        ["git", "-C", str(pool), "rev-parse", "FETCH_HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert fetched == target_sha
+    assert _missing_object_oids(pool, f"{target_sha}^{{tree}}") == []
+    assert old_blob in _missing_object_oids(pool, old_sha)
+
+    _git(["-C", str(pool), "remote", "set-url", "origin", "https://example.invalid/missing.git"], cwd=tmp_path)
+    ws_dir = tmp_path / "ws"
+    subprocess.run(
+        ["git", "-C", str(pool), "worktree", "add", "--detach", str(ws_dir), "FETCH_HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"GIT_TERMINAL_PROMPT": "0"},
+    )
+    assert (ws_dir / "history.txt").read_text(encoding="utf-8") == "new history\n"
+    assert (ws_dir / "target.txt").read_text(encoding="utf-8") == "target\n"
 
 
 def test_repo_lock_is_per_repo_identity(tmp_path: Path) -> None:

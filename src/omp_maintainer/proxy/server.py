@@ -12,6 +12,7 @@ each one names exactly one operation OMP Maintainer performs.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import subprocess
@@ -502,6 +503,11 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         client = await github_app_auth.client_for_repo(repo)
         return await operation(client)
 
+    # One git operation per pool at a time. Without this, a retry issued after
+    # a 504 races the still-running fetch from the timed-out request in the
+    # same object store.
+    git_repo_locks: dict[str, asyncio.Lock] = {}
+
     async def _repo_git_operation(
         request: Request,
         repo: str,
@@ -514,15 +520,17 @@ def create_proxy_app(settings: Settings) -> FastAPI:
             300.0,
             settings.gh_proxy_git_timeout_seconds + _GIT_TOKEN_TTL_BUFFER_SECONDS,
         )
-        try:
+        lock = git_repo_locks.setdefault(repo, asyncio.Lock())
+        async with lock:
+            try:
+                token = await github_app_auth.token_for_repo(repo, min_ttl_seconds=min_ttl_seconds)
+                return await operation(token)
+            except GitCommandError as exc:
+                if not _GIT_UPSTREAM_401_RE.search(exc.stderr):
+                    raise
+            github_app_auth.invalidate(repo)
             token = await github_app_auth.token_for_repo(repo, min_ttl_seconds=min_ttl_seconds)
             return await operation(token)
-        except GitCommandError as exc:
-            if not _GIT_UPSTREAM_401_RE.search(exc.stderr):
-                raise
-        github_app_auth.invalidate(repo)
-        token = await github_app_auth.token_for_repo(repo, min_ttl_seconds=min_ttl_seconds)
-        return await operation(token)
 
     # ---- meta ----
     @app.get("/healthz")
@@ -872,22 +880,23 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     # calls. Running them directly from an `async def` handler pins the
     # event loop until the subprocess returns; a hung git would freeze the
     # whole proxy. We bridge with `asyncio.to_thread` (work on a threadpool
-    # worker) wrapped in `asyncio.wait_for` (hard wall-clock cap, returns
-    # 504 on timeout). The subprocess itself can outlive the timeout — a
-    # proper subprocess.kill plumbing would have to live inside
-    # `git_ops._run_git`; flagged for follow-up.
+    # worker) wrapped in `asyncio.wait_for` (wall-clock cap, returns 504 on
+    # timeout). The thread cannot be cancelled, so on timeout the handler
+    # still waits for it, bounded by `git_ops._run_git`'s per-process kill,
+    # before answering. That keeps the per-repo lock held until git has
+    # really exited, so a retry never runs beside an orphaned fetch.
 
     async def _run_git_op(fn, *args, **kwargs):  # type: ignore[no-untyped-def]
+        work = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
         try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(fn, *args, **kwargs),
-                timeout=settings.gh_proxy_git_timeout_seconds,
-            )
+            return await asyncio.wait_for(asyncio.shield(work), timeout=settings.gh_proxy_git_timeout_seconds)
         except TimeoutError as exc:
             log.warning(
                 "github-broker: git op exceeded timeout",
                 extra={"op": fn.__name__, "timeout": settings.gh_proxy_git_timeout_seconds},
             )
+            with contextlib.suppress(Exception):
+                await work
             raise HTTPException(504, f"git {fn.__name__} timed out") from exc
 
     @app.post("/gh/v1/git/clone")
