@@ -42,6 +42,7 @@ from omp_maintainer.manual_triage import (
 from omp_maintainer.proxy_client import GitHubProxyClient, ProxyGitTransport
 from omp_maintainer.queue import WorkerPool
 from omp_maintainer.sandbox import SandboxManager
+from omp_maintainer.workspace_reconcile import WorkspaceReconciler
 
 log = logging.getLogger(__name__)
 
@@ -317,6 +318,7 @@ def _build_state(settings: Settings, pool_factory: _PoolFactory) -> dict[str, An
     pool = pool_factory(settings, db, github, sandbox, git_transport)
     autoclose = AutocloseScheduler(settings=settings, db=db, github=github)
     index_sync = IssueIndexSync(settings=settings, db=db, github=github)
+    reconciler = WorkspaceReconciler(settings=settings, db=db, github=github, sandbox=sandbox, wake=pool.wake)
     return {
         "settings": settings,
         "db": db,
@@ -327,6 +329,7 @@ def _build_state(settings: Settings, pool_factory: _PoolFactory) -> dict[str, An
         "issue_browse_cache": _IssueBrowseCache(),
         "autoclose": autoclose,
         "issue_index_sync": index_sync,
+        "workspace_reconcile": reconciler,
     }
 
 
@@ -345,9 +348,12 @@ def create_app(settings: Settings | None = None, *, pool_factory: _PoolFactory =
         await autoclose.start()
         index_sync: IssueIndexSync = app.state.bag["issue_index_sync"]
         await index_sync.start()
+        reconciler: WorkspaceReconciler = app.state.bag["workspace_reconcile"]
+        await reconciler.start()
         try:
             yield
         finally:
+            await reconciler.stop()
             await index_sync.stop()
             await autoclose.stop()
             await pool.stop(

@@ -377,7 +377,8 @@ def round_trip_app(proxy_settings: Settings):
                         "repo": {"full_name": "octo/widget"},
                     },
                     "base": {"ref": "main"},
-                    "state": "open",
+                    "state": "closed",
+                    "merged": True,
                     "user": {"login": "omp-maintainer-bot"},
                 },
             )
@@ -458,6 +459,8 @@ async def test_round_trip_all_endpoints(round_trip_app) -> None:
     assert existing_pr.head_ref == "feat"
     assert existing_pr.head_sha == "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
     assert existing_pr.author == "omp-maintainer-bot"
+    # The workspace reconciler finalizes a lost close as merged vs closed from this.
+    assert existing_pr.state == "closed" and existing_pr.merged is True
 
     posted = await client.post_comment("octo/widget", 1, "hi")
     assert isinstance(posted, CommentInfo)

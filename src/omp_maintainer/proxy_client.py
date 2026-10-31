@@ -732,6 +732,7 @@ def _pr_from(data: Any) -> PullRequestInfo:
         title=str(data.get("title") or ""),
         body=str(data.get("body") or ""),
         head_sha=str(data.get("head_sha") or ""),
+        merged=bool(data.get("merged")),
     )
 
 

@@ -29,6 +29,10 @@ IssueState = Literal[
     "abandoned",
 ]
 
+# Issue states after which the workspace is gone and no further work is due
+# unless a reopen or maintainer directive revives the row.
+FINAL_ISSUE_STATES: tuple[IssueState, ...] = ("merged", "closed", "abandoned")
+
 ReleaseState = Literal["awaiting_ci", "fixing", "green", "failed", "superseded"]
 
 SCHEMA = """
@@ -1080,6 +1084,39 @@ class Database:
             )
             for r in rows
         ]
+
+    def list_unfinished_issues(self) -> list[IssueRow]:
+        """Rows not yet in a `FINAL_ISSUE_STATES` state, oldest update first."""
+        placeholders = ",".join("?" * len(FINAL_ISSUE_STATES))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key, repo, number, branch, session_dir, pr_number, state, classification, updated_at "
+                f"FROM issues WHERE state NOT IN ({placeholders}) ORDER BY updated_at",
+                FINAL_ISSUE_STATES,
+            ).fetchall()
+        return [
+            IssueRow(
+                key=r["key"],
+                repo=r["repo"],
+                number=int(r["number"]),
+                branch=r["branch"],
+                session_dir=r["session_dir"],
+                pr_number=int(r["pr_number"]) if r["pr_number"] is not None else None,
+                state=r["state"],
+                updated_at=r["updated_at"],
+                classification=r["classification"],
+            )
+            for r in rows
+        ]
+
+    def has_active_event(self, issue_key: str) -> bool:
+        """True while any queued (incl. delayed retry) or running event targets `issue_key`."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM events WHERE issue_key=? AND state IN ('queued','running') LIMIT 1",
+                (issue_key,),
+            ).fetchone()
+        return row is not None
 
     def processed_issue_keys(self, keys: Iterable[str]) -> set[str]:
         """Return the subset of `keys` that have a row in the `issues` table.
