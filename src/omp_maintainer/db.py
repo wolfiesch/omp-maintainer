@@ -578,8 +578,13 @@ class Database:
         payload: Mapping[str, Any],
         state: EventState = "queued",
         allowed_existing_states: tuple[EventState, ...],
+        require_idle_key: bool = False,
     ) -> bool:
-        """Replace an existing event only when its current state is permitted."""
+        """Replace an existing event only when its current state is permitted.
+
+        With `require_idle_key`, also refuse while any other queued or running
+        event targets `issue_key`, checked in the same transaction as the insert.
+        """
         now = _utcnow()
         with self._txn() as conn:
             row = conn.execute(
@@ -589,6 +594,15 @@ class Database:
             if row is not None:
                 if row["state"] not in allowed_existing_states:
                     return False
+            if require_idle_key and issue_key is not None:
+                busy = conn.execute(
+                    "SELECT 1 FROM events WHERE issue_key = ? AND state IN ('queued','running') "
+                    "AND delivery_id <> ? LIMIT 1",
+                    (issue_key, delivery_id),
+                ).fetchone()
+                if busy is not None:
+                    return False
+            if row is not None:
                 conn.execute("DELETE FROM events WHERE delivery_id = ?", (delivery_id,))
             conn.execute(
                 """

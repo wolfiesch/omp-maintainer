@@ -245,6 +245,10 @@ class WorkspaceReconciler:
             payload=missed.payload,
             state="queued",
             allowed_existing_states=INACTIVE_EVENT_STATES,
+            # A webhook (e.g. a reopen) may have landed during the GitHub round
+            # trip; re-check in the insert's transaction so a stale close never
+            # queues behind it.
+            require_idle_key=True,
         )
         if queued:
             log.info(

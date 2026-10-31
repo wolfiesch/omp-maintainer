@@ -14,7 +14,7 @@ from omp_maintainer.github_client import GitHubError, IssueInfo, PullRequestInfo
 from omp_maintainer.queue import WorkerPool
 from omp_maintainer.sandbox import SandboxManager, parse_workspace_key, workspace_key
 from omp_maintainer.slot_pool import SlotPool
-from omp_maintainer.workspace_reconcile import WorkspaceReconciler
+from omp_maintainer.workspace_reconcile import WorkspaceReconciler, reconcile_delivery_id
 
 REPO = "octo/widget"
 
@@ -227,6 +227,29 @@ async def test_second_tick_does_not_duplicate_pending_close(settings, db, sandbo
 
     assert first["queued"] == 1
     assert second["active"] == 1 and second["queued"] == 0
+
+
+async def test_webhook_landing_during_state_check_wins(settings, db, sandbox) -> None:
+    """A reopen queued while the GitHub call is in flight must not get a stale close behind it."""
+    db.upsert_issue(key=f"{REPO}#30", repo=REPO, number=30, state="closed")
+    _backdate(db, f"{REPO}#30")
+    _make_workspace(sandbox, REPO, 30)
+
+    class _ReopenDuringCheck(_LiveGitHub):
+        async def get_issue(self, repo: str, number: int) -> IssueInfo:
+            db.record_event(
+                delivery_id="reopen-30",
+                event_type="issues",
+                repo=REPO,
+                issue_key=f"{REPO}#30",
+                payload={"action": "reopened", "issue": {"number": 30}, "repository": {"full_name": REPO}},
+            )
+            return await super().get_issue(repo, number)
+
+    counts = await _reconciler(settings, db, sandbox, _ReopenDuringCheck(closed={30})).tick()
+
+    assert counts["queued"] == 0
+    assert db.get_event(reconcile_delivery_id("issues", REPO, 30)) is None
 
 
 @pytest.mark.parametrize(
