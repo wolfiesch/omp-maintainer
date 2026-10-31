@@ -1682,6 +1682,7 @@ def _commit_new_blob_upstream(upstream: Path, tmp_path: Path, *, path: str, cont
     """Add a fresh blob upstream and return the new commit SHA."""
     contrib = Path(tempfile.mkdtemp(prefix=f"contrib-{path.replace('/', '_')}-", dir=tmp_path))
     _git(["clone", f"file://{upstream}", str(contrib)], cwd=tmp_path)
+    (contrib / path).parent.mkdir(parents=True, exist_ok=True)
     (contrib / path).write_text(content, encoding="utf-8")
     _git(["-C", str(contrib), "add", path], cwd=tmp_path)
     subprocess.run(
@@ -1885,6 +1886,45 @@ def test_checkout_fetch_backfills_only_target_tree(tmp_path: Path, op: str, expl
     )
     assert (ws_dir / "history.txt").read_text(encoding="utf-8") == "new history\n"
     assert (ws_dir / "target.txt").read_text(encoding="utf-8") == "target\n"
+
+
+@pytest.mark.parametrize("explicit_remote", [False, True], ids=["origin", "explicit-url"])
+def test_fetch_prune_backfills_default_branch_policy_blob(tmp_path: Path, explicit_remote: bool) -> None:
+    """``load_repo_policy`` reads ``origin/<default>:.github/omp-maintainer.yml``
+    without credentials. A policy change on main after the pool clone must be
+    readable after the pool refresh, or every task fails closed."""
+    upstream = _partial_clone_upstream(tmp_path)
+    pool = tmp_path / "pool"
+    _git(
+        [
+            "clone",
+            "--filter=blob:none",
+            "--no-tags",
+            "--no-checkout",
+            "--branch",
+            "main",
+            f"file://{upstream}",
+            str(pool),
+        ],
+        cwd=tmp_path,
+    )
+    _commit_new_blob_upstream(upstream, tmp_path, path=".github/omp-maintainer.yml", content="version: 1\n")
+
+    if explicit_remote:
+        _git(["-C", str(pool), "remote", "set-url", "origin", "https://example.invalid/missing.git"], cwd=tmp_path)
+        git_fetch_prune(pool, token=None, remote_url=f"file://{upstream}")
+    else:
+        git_fetch_prune(pool, token=None)
+        _git(["-C", str(pool), "remote", "set-url", "origin", "https://example.invalid/missing.git"], cwd=tmp_path)
+
+    shown = subprocess.run(
+        ["git", "-C", str(pool), "show", "refs/remotes/origin/main:.github/omp-maintainer.yml"],
+        capture_output=True,
+        text=True,
+        env=os.environ | {"GIT_TERMINAL_PROMPT": "0"},
+    )
+    assert shown.returncode == 0, shown.stderr
+    assert shown.stdout == "version: 1\n"
 
 
 def test_repo_lock_is_per_repo_identity(tmp_path: Path) -> None:

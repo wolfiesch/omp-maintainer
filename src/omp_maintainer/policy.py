@@ -17,9 +17,9 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from omp_maintainer.git_ops import REPO_POLICY_PATH as _POLICY_PATH
 from omp_maintainer.git_ops import _git_subprocess_env
 
-_POLICY_PATH = ".github/omp-maintainer.yml"
 _POLICY_VERSION = 1
 _MISSING_POLICY_PATH = f"path '{_POLICY_PATH}' does not exist in "
 _REF_DISALLOWED = re.compile(r"[\x00-\x20~^:?*\[\\]")

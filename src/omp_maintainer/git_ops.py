@@ -115,6 +115,10 @@ _BAD_OBJECT_REF_RE = re.compile(
     r"(?:fatal: bad object (?P<bad>refs/[^\s]+)|error: (?P<invalid>refs/[^\s]+) does not point to a valid object!)"
 )
 _FETCH_PRUNE_REPAIR_ATTEMPTS = 8
+_OID_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+REPO_POLICY_PATH = ".github/omp-maintainer.yml"
+"""Repository policy file, read from ``origin/<default>`` by ``policy.load_repo_policy``."""
 
 _SHARED_OMP_GID = 2000
 _AGENT_HOME = Path("/srv/agent-home")
@@ -553,18 +557,62 @@ def fetch_prune(
             safe_directory=safe_directory,
         )
         if proc.returncode == 0:
-            return
+            break
         last_proc = proc
         output = f"{proc.stderr}\n{proc.stdout}"
         if not _repair_fetch_prune_failure(repo_dir, output):
             _check(proc, ["git", *args])
-    assert last_proc is not None
-    _check(last_proc, ["git", *args])
+    else:
+        assert last_proc is not None
+        _check(last_proc, ["git", *args])
+    # `load_repo_policy` reads the policy from `origin/<default>` without
+    # credentials, so its blob must be local before any task is prepared.
+    # Best-effort: on failure the policy read fails closed (no mutations).
+    try:
+        _backfill_missing_objects(
+            repo_dir,
+            _remote_policy_blobs(repo_dir, safe_directory=safe_directory),
+            remote=remote_url or "origin",
+            token=token,
+            auth_url=auth_url,
+            extra_env=extra_env,
+            safe_directory=safe_directory,
+        )
+    except GitCommandError as exc:
+        log.warning("policy blob backfill failed", extra={"repo_dir": str(repo_dir), "stderr": exc.stderr})
 
 
-def _backfill_tree_blobs(
+def _remote_policy_blobs(repo_dir: Path, *, safe_directory: Path | None) -> list[str]:
+    """OIDs of ``REPO_POLICY_PATH`` at every ``refs/remotes/origin/*`` tip.
+
+    ``cat-file --batch-check=%(objectname)`` resolves ``<ref>:<path>`` through
+    trees only and never reads the blob, so it cannot trigger a lazy fetch.
+    """
+    refs_args = ["for-each-ref", "--format=%(refname)", "refs/remotes/origin/"]
+    refs = _check(
+        _run_git(refs_args, cwd=repo_dir, token=None, safe_directory=safe_directory),
+        ["git", *refs_args],
+    ).stdout.split()
+    refs = [ref for ref in refs if ref != "refs/remotes/origin/HEAD"]
+    if not refs:
+        return []
+    check_args = ["cat-file", "--batch-check=%(objectname)"]
+    resolved = _check(
+        _run_git(
+            check_args,
+            cwd=repo_dir,
+            token=None,
+            safe_directory=safe_directory,
+            input="".join(f"{ref}:{REPO_POLICY_PATH}\n" for ref in refs),
+        ),
+        ["git", *check_args],
+    ).stdout.splitlines()
+    return sorted({line for line in resolved if _OID_RE.fullmatch(line)})
+
+
+def _backfill_missing_objects(
     repo_dir: Path,
-    rev: str,
+    starts: list[str],
     *,
     remote: str,
     token: str | None,
@@ -572,15 +620,18 @@ def _backfill_tree_blobs(
     extra_env: Mapping[str, str] | None,
     safe_directory: Path | None,
 ) -> None:
-    """Fetch exactly the blobs ``rev``'s tree needs that the pool lacks.
+    """Fetch the objects reachable from ``starts`` that the pool lacks.
 
-    ``rev-list --missing=print`` disables lazy fetching, so the listing never
-    reaches the network. The follow-up fetch mirrors git's own promisor
-    backfill (noop negotiation, OIDs on stdin, FETCH_HEAD untouched) but runs
-    with this call's credentials, so the cost is bounded by one checkout
-    instead of the repository's full history.
+    ``starts`` are trees or blobs, never commits, so the walk is bounded by
+    one checkout instead of the repository's history. ``rev-list
+    --missing=print`` disables lazy fetching, so the listing never reaches
+    the network. The follow-up fetch mirrors git's own promisor backfill
+    (noop negotiation, OIDs on stdin, FETCH_HEAD untouched) but runs with
+    this call's credentials.
     """
-    listing_args = ["rev-list", "--objects", "--missing=print", f"{rev}^{{tree}}"]
+    if not starts:
+        return
+    listing_args = ["rev-list", "--objects", "--missing=print", *starts]
     listing = _check(
         _run_git(listing_args, cwd=repo_dir, token=None, safe_directory=safe_directory),
         ["git", *listing_args],
@@ -635,7 +686,7 @@ def fetch_ref(
         fatal: could not fetch <sha> from promisor remote
 
     (oh-my-pi#1818). The fetch stays incremental and
-    :func:`_backfill_tree_blobs` then fills only the checkout's missing
+    :func:`_backfill_missing_objects` then fills only the checkout's missing
     blobs; re-downloading the whole repository on every checkout exceeds the
     broker's git timeout on large repositories. The on-disk partial-clone
     config is untouched, so ``fetch_prune`` keeps skipping blobs.
@@ -661,9 +712,9 @@ def fetch_ref(
         )
         return
     try:
-        _backfill_tree_blobs(
+        _backfill_missing_objects(
             repo_dir,
-            "FETCH_HEAD",
+            ["FETCH_HEAD^{tree}"],
             remote=remote,
             token=token,
             auth_url=auth_url,
@@ -707,9 +758,9 @@ def fetch_pr_head(
         ),
         ["git", *args],
     )
-    _backfill_tree_blobs(
+    _backfill_missing_objects(
         repo_dir,
-        "FETCH_HEAD",
+        ["FETCH_HEAD^{tree}"],
         remote=remote,
         token=token,
         auth_url=auth_url,

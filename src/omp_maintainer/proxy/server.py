@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import re
 import subprocess
@@ -250,6 +251,7 @@ def _resolve_hmac_key(cfg: Settings) -> bytes:
 
 _ORIGIN_READ_TIMEOUT_SECONDS = 5.0
 _GIT_TOKEN_TTL_BUFFER_SECONDS = 60.0
+_CURRENT_GIT_REPO: contextvars.ContextVar[str | None] = contextvars.ContextVar("broker_git_repo", default=None)
 _GIT_UPSTREAM_401_RE = re.compile(r"(?<!\d)401(?!\d)")
 
 
@@ -503,10 +505,12 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         client = await github_app_auth.client_for_repo(repo)
         return await operation(client)
 
-    # One git operation per pool at a time. Without this, a retry issued after
-    # a 504 races the still-running fetch from the timed-out request in the
-    # same object store.
+    # One git operation per pool at a time. A git thread that outlived its
+    # request's timeout is parked in `git_repo_orphans`; the next operation on
+    # that repo waits for it (bounded by `git_ops._run_git`'s per-process
+    # kill) so a retry never races an orphaned fetch in the same object store.
     git_repo_locks: dict[str, asyncio.Lock] = {}
+    git_repo_orphans: dict[str, asyncio.Future[Any]] = {}
 
     async def _repo_git_operation(
         request: Request,
@@ -522,15 +526,23 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         )
         lock = git_repo_locks.setdefault(repo, asyncio.Lock())
         async with lock:
+            orphan = git_repo_orphans.pop(repo, None)
+            if orphan is not None:
+                with contextlib.suppress(Exception):
+                    await orphan
+            scope = _CURRENT_GIT_REPO.set(repo)
             try:
+                try:
+                    token = await github_app_auth.token_for_repo(repo, min_ttl_seconds=min_ttl_seconds)
+                    return await operation(token)
+                except GitCommandError as exc:
+                    if not _GIT_UPSTREAM_401_RE.search(exc.stderr):
+                        raise
+                github_app_auth.invalidate(repo)
                 token = await github_app_auth.token_for_repo(repo, min_ttl_seconds=min_ttl_seconds)
                 return await operation(token)
-            except GitCommandError as exc:
-                if not _GIT_UPSTREAM_401_RE.search(exc.stderr):
-                    raise
-            github_app_auth.invalidate(repo)
-            token = await github_app_auth.token_for_repo(repo, min_ttl_seconds=min_ttl_seconds)
-            return await operation(token)
+            finally:
+                _CURRENT_GIT_REPO.reset(scope)
 
     # ---- meta ----
     @app.get("/healthz")
@@ -881,10 +893,9 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     # event loop until the subprocess returns; a hung git would freeze the
     # whole proxy. We bridge with `asyncio.to_thread` (work on a threadpool
     # worker) wrapped in `asyncio.wait_for` (wall-clock cap, returns 504 on
-    # timeout). The thread cannot be cancelled, so on timeout the handler
-    # still waits for it, bounded by `git_ops._run_git`'s per-process kill,
-    # before answering. That keeps the per-repo lock held until git has
-    # really exited, so a retry never runs beside an orphaned fetch.
+    # timeout). The thread cannot be cancelled; on timeout it is parked as the
+    # repo's orphan (see `_repo_git_operation`) and the handler answers 504
+    # without waiting for it.
 
     async def _run_git_op(fn, *args, **kwargs):  # type: ignore[no-untyped-def]
         work = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
@@ -895,8 +906,12 @@ def create_proxy_app(settings: Settings) -> FastAPI:
                 "github-broker: git op exceeded timeout",
                 extra={"op": fn.__name__, "timeout": settings.gh_proxy_git_timeout_seconds},
             )
-            with contextlib.suppress(Exception):
-                await work
+            # Retrieve the eventual result so an unawaited orphan never logs
+            # "exception was never retrieved".
+            work.add_done_callback(lambda done: done.cancelled() or done.exception())
+            repo = _CURRENT_GIT_REPO.get()
+            if repo is not None:
+                git_repo_orphans[repo] = work
             raise HTTPException(504, f"git {fn.__name__} timed out") from exc
 
     @app.post("/gh/v1/git/clone")
